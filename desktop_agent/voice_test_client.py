@@ -8,6 +8,8 @@ import json
 import os
 import queue
 from dotenv import load_dotenv
+from tts_normalizer import TTSNormalizer
+from sentence_chunker import SentenceChunker
 from google.cloud import speech, texttospeech
 from google.api_core.exceptions import GoogleAPIError
 
@@ -117,6 +119,30 @@ def _synthesize_text_sync(text: str) -> bytes:
 
 async def synthesize_text_async(text: str) -> bytes:
     return await asyncio.to_thread(_synthesize_text_sync, text)
+
+async def tts_audio_worker(tts_queue: asyncio.Queue):
+    """
+    Worker task that consumes sanitized sentences from the queue,
+    synthesizes TTS audio, and streams audio playback immediately.
+    """
+    while True:
+        sentence = await tts_queue.get()
+        if sentence is None:
+            tts_queue.task_done()
+            break
+            
+        if cancel_playback_event.is_set():
+            tts_queue.task_done()
+            continue
+            
+        try:
+            audio_response = await synthesize_text_async(sentence)
+            if audio_response and not cancel_playback_event.is_set():
+                await play_audio_chunked(audio_response)
+        except Exception as e:
+            print(f"\nTTS Worker Error: {e}")
+        finally:
+            tts_queue.task_done()
 
 class MicrophoneStream:
     def __init__(self, rate, chunk):
@@ -269,25 +295,74 @@ async def voice_client():
                     payload = {"type": "transcript", "text": transcript}
                     await websocket.send(json.dumps(payload))
                     
-                    # 4. Wait for text response from Hub
+                    # 4. Wait for text stream from Hub and queue sentence-level TTS
                     try:
-                        response_str = await asyncio.wait_for(websocket.recv(), timeout=10.0)
-                        response_data = json.loads(response_str)
+                        tts_queue = asyncio.Queue()
+                        chunker = SentenceChunker()
+                        cancel_playback_event.clear()
+                        tts_worker_task = asyncio.create_task(tts_audio_worker(tts_queue))
                         
-                        if response_data.get("type") == "response":
-                            hub_text = response_data.get("text", "")
-                            print(f"🤖 Hub says: {hub_text}")
+                        sys.stdout.write("🤖 Hub thinking...")
+                        sys.stdout.flush()
+                        
+                        while True:
+                            response_str = await asyncio.wait_for(websocket.recv(), timeout=30.0)
+                            response_data = json.loads(response_str)
+                            msg_type = response_data.get("type")
                             
-                            # 5. Synthesize text to speech
-                            audio_response = await synthesize_text_async(hub_text)
-                            if audio_response:
-                                # Play chunked audio (allows barge-in cancellation)
-                                await play_audio_chunked(audio_response)
+                            if msg_type == "response_start":
+                                sys.stdout.write("\r🤖 Hub streaming: ")
+                                sys.stdout.flush()
+                                chunker.reset()
+                            elif msg_type == "response_chunk":
+                                delta = response_data.get("delta", "")
+                                # 1. Render raw markdown delta to UI/stdout
+                                sys.stdout.write(delta)
+                                sys.stdout.flush()
+                                
+                                # 2. Feed chunker & queue clean sentences to TTS worker
+                                ready_sentences = chunker.add_delta(delta)
+                                for sentence in ready_sentences:
+                                    await tts_queue.put(sentence)
+                                    
+                            elif msg_type == "response_end":
+                                print() # newline after stream completes
+                                # Flush any trailing text from chunker
+                                final_sentences = chunker.flush()
+                                for sentence in final_sentences:
+                                    await tts_queue.put(sentence)
+                                    
+                                # Signal worker to finish and wait for audio completion
+                                await tts_queue.put(None)
+                                await tts_worker_task
+                                break
+                                
+                            elif msg_type == "error":
+                                err_msg = response_data.get("message", "Unknown error")
+                                print(f"\n❌ Hub error: {err_msg}")
+                                cancel_playback_event.set()
+                                await tts_queue.put(None)
+                                break
+                                
+                            elif msg_type == "response": # Legacy fallback
+                                hub_text = response_data.get("text", "")
+                                print(f"\n🤖 Hub says: {hub_text}")
+                                clean_text = TTSNormalizer.normalize(hub_text)
+                                audio_response = await synthesize_text_async(clean_text)
+                                if audio_response:
+                                    await play_audio_chunked(audio_response)
+                                break
                                 
                     except asyncio.TimeoutError:
-                        print("⏳ Timeout waiting for Hub response.")
+                        print("\n⏳ Timeout waiting for Hub response.")
+                        cancel_playback_event.set()
+                        if 'tts_queue' in locals():
+                            await tts_queue.put(None)
                     except json.JSONDecodeError:
-                        print("❌ Received invalid JSON from Hub")
+                        print("\n❌ Received invalid JSON from Hub")
+                        cancel_playback_event.set()
+                        if 'tts_queue' in locals():
+                            await tts_queue.put(None)
                             
         except websockets.exceptions.ConnectionClosed as e:
             wait_time = min(max_backoff, 2 ** attempt)

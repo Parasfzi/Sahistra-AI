@@ -4,3 +4,8 @@ websockets
 google-cloud-speech
 google-cloud-texttospeech
 pydantic
+python-dotenv
+google-genai
+groq
+pytest
+pytest-asyncio
